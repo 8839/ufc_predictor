@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+data/ufc.db
+.env
+*.log
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.duckdb
+
+# If your DB is in a specific folder, ignore that too:
+data/
+db/
+database/
+data/ufc.db
