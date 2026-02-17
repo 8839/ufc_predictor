@@ -6,9 +6,16 @@ from datetime import datetime
 import database
 import utils
 from config import (
+    ACTIVITY_LOOKBACK_YEARS,
+    ACTIVITY_OPTIMAL_FIGHTS_PER_YEAR,
+    ACTIVITY_RING_RUST_DAYS,
     FQS_CONVERGENCE_THRESHOLD,
     FQS_MAX_ITERATIONS,
+    OVERALL_DEC_RATE,
+    OVERALL_KO_RATE,
+    OVERALL_SUB_RATE,
     RECENCY_LAMBDA,
+    WEIGHT_ACTIVITY_RATE,
     WEIGHT_CHAMPIONSHIP,
     WEIGHT_LOSS_QUALITY,
     WEIGHT_OPPONENT_QUALITY,
@@ -24,8 +31,86 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Weight Class Baselines Computation
+# ---------------------------------------------------------------------------
+
+def compute_weight_class_baselines() -> dict[str, dict]:
+    """Compute KO/SUB/DEC rates per weight class from all fights.
+
+    Persists results to the weight_class_baselines table and returns
+    a dict mapping weight_class -> {ko_rate, sub_rate, dec_rate,
+    avg_finish_round, avg_fights_per_year}.
+    """
+    conn = database.get_connection()
+
+    rows = conn.execute("""
+        SELECT weight_class,
+               COUNT(*) as total,
+               SUM(CASE WHEN win_method = 'KO/TKO' THEN 1 ELSE 0 END) as ko_count,
+               SUM(CASE WHEN win_method = 'SUB' THEN 1 ELSE 0 END) as sub_count,
+               SUM(CASE WHEN win_method IN ('U-DEC','M-DEC','S-DEC') THEN 1 ELSE 0 END) as dec_count,
+               AVG(CASE WHEN win_method IN ('KO/TKO','SUB') THEN finish_round ELSE NULL END) as avg_finish_round,
+               MIN(event_date) as earliest,
+               MAX(event_date) as latest
+        FROM fights
+        WHERE weight_class IS NOT NULL AND winner_id IS NOT NULL
+        GROUP BY weight_class
+    """).fetchall()
+
+    conn.close()
+
+    baselines = {}
+    now = datetime.now()
+
+    for r in rows:
+        wc = r["weight_class"]
+        total = r["total"]
+        if total == 0:
+            continue
+
+        ko_rate = (r["ko_count"] or 0) / total
+        sub_rate = (r["sub_count"] or 0) / total
+        dec_rate = (r["dec_count"] or 0) / total
+        avg_finish = r["avg_finish_round"] or 2.0
+
+        # Avg fights per year for this weight class
+        earliest = r["earliest"]
+        latest = r["latest"]
+        if earliest and latest:
+            try:
+                dt_early = datetime.strptime(earliest, "%Y-%m-%d")
+                dt_late = datetime.strptime(latest, "%Y-%m-%d")
+                span_years = max((dt_late - dt_early).days / 365.25, 1.0)
+                avg_fights_per_year = total / span_years
+            except ValueError:
+                avg_fights_per_year = 2.0
+        else:
+            avg_fights_per_year = 2.0
+
+        baseline = {
+            "weight_class": wc,
+            "ko_rate": round(ko_rate, 4),
+            "sub_rate": round(sub_rate, 4),
+            "dec_rate": round(dec_rate, 4),
+            "avg_finish_round": round(avg_finish, 2),
+            "avg_fights_per_year": round(avg_fights_per_year, 2),
+            "last_computed": now.isoformat(),
+        }
+
+        database.upsert_weight_class_baseline(baseline)
+        baselines[wc] = baseline
+
+    return baselines
+
+
+# ---------------------------------------------------------------------------
 # 5.1 Opponent Quality Score
 # ---------------------------------------------------------------------------
+
+def _get_opponent_id(fight: dict, fighter_id: str) -> str:
+    """Return the opponent's fighter ID from a fight record."""
+    return fight["fighter2_id"] if fight["fighter1_id"] == fighter_id else fight["fighter1_id"]
+
 
 def _opponent_win_rate(fighter_id: str) -> float:
     """Simple win rate for a fighter (0-1)."""
@@ -38,61 +123,138 @@ def _opponent_win_rate(fighter_id: str) -> float:
     return (f["wins"] or 0) / total
 
 
-def _opponent_opponent_strength(fighter_id: str) -> float:
-    """Average win rate of a fighter's opponents (level 2)."""
+def _fqs_cache_range(fqs_cache: dict) -> tuple[float, float]:
+    """Return (min, max) of FQS values in the cache."""
+    vals = fqs_cache.values()
+    return min(vals), max(vals)
+
+
+def _opponent_strength(fighter_id: str, fqs_cache: dict | None = None,
+                       fqs_range: tuple[float, float] | None = None) -> float:
+    """Get opponent strength (0-1).
+
+    When fqs_cache is available, rescales the opponent's FQS to the typical
+    win-rate range [0.25, 0.90] and returns the maximum of that and the raw
+    win rate.  This uplifts fighters whose record doesn't reflect their true
+    quality (e.g. a gatekeeper who fights only killers).
+    """
+    win_rate = _opponent_win_rate(fighter_id)
+    if fqs_cache and fighter_id in fqs_cache and fqs_range:
+        fqs_val = fqs_cache[fighter_id]
+        fqs_min, fqs_max = fqs_range
+        if fqs_max > fqs_min:
+            normalized = (fqs_val - fqs_min) / (fqs_max - fqs_min)
+            fqs_scaled = 0.25 + normalized * 0.65  # maps to [0.25, 0.90]
+        else:
+            fqs_scaled = 0.50
+        return max(win_rate, fqs_scaled)
+    return win_rate
+
+
+def _opponent_opponent_strength(fighter_id: str, fqs_cache: dict | None = None,
+                                fqs_range: tuple[float, float] | None = None) -> float:
+    """Average strength of a fighter's opponents (level 2)."""
     fights = database.get_fighter_fights(fighter_id)
     if not fights:
         return 0.5
     rates = []
     for fight in fights:
-        opp_id = fight["fighter2_id"] if fight["fighter1_id"] == fighter_id else fight["fighter1_id"]
-        rates.append(_opponent_win_rate(opp_id))
+        opp_id = _get_opponent_id(fight, fighter_id)
+        rates.append(_opponent_strength(opp_id, fqs_cache, fqs_range))
     return sum(rates) / len(rates) if rates else 0.5
 
 
-def calc_opponent_quality(fighter_id: str) -> float:
-    """Calculate opponent quality score (0-100). Spec section 5.1."""
+def calc_opponent_quality(fighter_id: str, fqs_cache: dict | None = None) -> float:
+    """Calculate opponent quality score (0-100). Spec section 5.1.
+
+    Uses recency-weighted opponent strength so that recent fights against
+    elite opponents count more than early-career fights.  When fqs_cache is
+    provided, uses FQS-based opponent strength (via max(win_rate, fqs/100))
+    so fighters get proper credit for beating high-quality opponents whose
+    records may be deflated by tough competition.
+    """
     fights = database.get_fighter_fights(fighter_id)
     if not fights:
         return 50.0
 
+    # Precompute FQS range once for rescaling
+    fqs_range = _fqs_cache_range(fqs_cache) if fqs_cache else None
+
     win_qualities = []
+    win_weights = []
     loss_qualities = []
+    loss_weights = []
 
     for fight in fights:
-        opp_id = fight["fighter2_id"] if fight["fighter1_id"] == fighter_id else fight["fighter1_id"]
+        opp_id = _get_opponent_id(fight, fighter_id)
 
-        opp_strength = _opponent_win_rate(opp_id)
-        opp_opp_strength = _opponent_opponent_strength(opp_id)
-        fight_opp_quality = 0.7 * opp_strength + 0.3 * opp_opp_strength
+        opp_str = _opponent_strength(opp_id, fqs_cache, fqs_range)
+        opp_opp_str = _opponent_opponent_strength(opp_id, fqs_cache, fqs_range)
+        fight_opp_quality = 0.7 * opp_str + 0.3 * opp_opp_str
+
+        # Recency weight: recent fights count more (decay over years)
+        years = utils.years_since(fight.get("event_date"))
+        recency_weight = math.exp(-0.15 * years)  # gentler decay than recency score
 
         is_win = fight["winner_id"] == fighter_id
         is_loss = fight["winner_id"] is not None and fight["winner_id"] != fighter_id
 
         if is_win:
-            win_qualities.append(fight_opp_quality)
+            win_qualities.append(fight_opp_quality * recency_weight)
+            win_weights.append(recency_weight)
         elif is_loss:
-            loss_qualities.append(fight_opp_quality)
-        # draws/NC: skip
+            loss_qualities.append((1.0 - fight_opp_quality) * recency_weight)
+            loss_weights.append(recency_weight)
 
-    avg_win_q = sum(win_qualities) / len(win_qualities) if win_qualities else 0.0
-    avg_loss_penalty = (
-        sum(1.0 - q for q in loss_qualities) / len(loss_qualities)
-        if loss_qualities
-        else 0.0
-    )
+    total_win_w = sum(win_weights)
+    total_loss_w = sum(loss_weights)
+    avg_win_q = sum(win_qualities) / total_win_w if total_win_w > 0 else 0.0
+    avg_loss_penalty = sum(loss_qualities) / total_loss_w if total_loss_w > 0 else 0.0
 
     raw = avg_win_q - 0.5 * avg_loss_penalty
-    # Normalize: raw is roughly in [-0.5, 1.0] range → map to 0-100
-    return _clamp(raw * 100.0)
+    # Stretch factor: raw practically ranges [0, 0.75] due to level-2
+    # regression.  Use *130 to spread the distribution into full 0-100.
+    return _clamp(raw * 130.0)
 
 
 # ---------------------------------------------------------------------------
 # 5.2 Win Method Score
 # ---------------------------------------------------------------------------
 
-def calc_win_method_score(fighter_id: str) -> float:
-    """Calculate win method score (0-100). Spec section 5.2."""
+def _wc_method_multiplier(method: str, fight_wc: str | None,
+                          wc_baselines: dict | None) -> float:
+    """Weight-class multiplier for a win method.
+
+    KO at flyweight (low KO rate) gets a bonus; KO at heavyweight (high KO
+    rate) gets a penalty.  Decisions at heavyweight get a slight bonus
+    (surviving = durability).  Clamped to [0.75, 1.35].
+    """
+    if not wc_baselines or not fight_wc or fight_wc not in wc_baselines:
+        return 1.0
+
+    bl = wc_baselines[fight_wc]
+
+    if method == "KO/TKO":
+        wc_rate = bl.get("ko_rate") or OVERALL_KO_RATE
+        raw = OVERALL_KO_RATE / wc_rate if wc_rate > 0 else 1.0
+    elif method == "SUB":
+        wc_rate = bl.get("sub_rate") or OVERALL_SUB_RATE
+        raw = OVERALL_SUB_RATE / wc_rate if wc_rate > 0 else 1.0
+    elif method in ("U-DEC", "M-DEC", "S-DEC"):
+        wc_rate = bl.get("dec_rate") or OVERALL_DEC_RATE
+        raw = OVERALL_DEC_RATE / wc_rate if wc_rate > 0 else 1.0
+    else:
+        return 1.0
+
+    return max(0.75, min(1.35, raw))
+
+
+def calc_win_method_score(fighter_id: str, wc_baselines: dict | None = None) -> float:
+    """Calculate win method score (0-100). Spec section 5.2.
+
+    When wc_baselines is provided, applies weight-class multipliers so that
+    e.g. a KO at flyweight is worth more than a KO at heavyweight.
+    """
     fights = database.get_fighter_fights(fighter_id)
     if not fights:
         return 50.0
@@ -110,14 +272,18 @@ def calc_win_method_score(fighter_id: str) -> float:
         if is_finish and fight["finish_round"]:
             round_bonus = max(0, (6 - fight["finish_round"])) * 0.5
 
-        scores.append(base + round_bonus)
+        raw_score = base + round_bonus
+
+        # Apply weight-class multiplier
+        wc_mult = _wc_method_multiplier(method, fight.get("weight_class"), wc_baselines)
+        scores.append(raw_score * wc_mult)
 
     if not scores:
         return 50.0
 
     avg = sum(scores) / len(scores)
-    # Max possible score = 10 + 2.5 = 12.5, normalize to 0-100
-    return _clamp((avg / 12.5) * 100.0)
+    # Max possible = (10 + 2.5) * 1.35 ≈ 16.9, use 15.0 as normalizer
+    return _clamp((avg / 15.0) * 100.0)
 
 
 # ---------------------------------------------------------------------------
@@ -295,17 +461,79 @@ def calc_streak_score(fighter_id: str) -> float:
         if streak_has_title_win:
             score += 10
 
-    # Ring rust penalty
-    if fights:
-        years_since_last = utils.years_since(fights[0]["event_date"])
-        if years_since_last > 1.5:
-            score -= 10
+    # Ring rust penalty removed — now handled by calc_activity_rate
 
     return _clamp(score)
 
 
 # ---------------------------------------------------------------------------
-# 5.6 Championship Modifier
+# 5.6 Activity Rate Score (NEW in V2)
+# ---------------------------------------------------------------------------
+
+def calc_activity_rate(fighter_id: str, wc_baselines: dict | None = None) -> float:
+    """Calculate activity rate score (0-100).
+
+    Components:
+      1. (0-50 pts) fights/year over last ACTIVITY_LOOKBACK_YEARS vs optimal
+      2. (0-40 pts) days since last fight (tiered)
+      3. (0-10 pts) compared to weight class average activity
+    """
+    fight_dates = database.get_fighter_fight_dates(fighter_id)
+    if not fight_dates:
+        return 25.0  # no data — below average
+
+    now = datetime.now()
+
+    # Component 1: fights per year in lookback window
+    cutoff = now.timestamp() - ACTIVITY_LOOKBACK_YEARS * 365.25 * 86400
+    recent_count = 0
+    for d in fight_dates:
+        try:
+            dt = datetime.strptime(d, "%Y-%m-%d")
+            if dt.timestamp() >= cutoff:
+                recent_count += 1
+        except ValueError:
+            continue
+
+    fights_per_year = recent_count / ACTIVITY_LOOKBACK_YEARS
+    ratio = fights_per_year / ACTIVITY_OPTIMAL_FIGHTS_PER_YEAR
+    comp1 = min(ratio, 1.0) * 50.0
+
+    # Component 2: days since last fight (tiered)
+    try:
+        last_fight = datetime.strptime(fight_dates[0], "%Y-%m-%d")
+        days_since = (now - last_fight).days
+    except ValueError:
+        days_since = 9999
+
+    if days_since < 90:
+        comp2 = 40.0
+    elif days_since < 180:
+        comp2 = 35.0
+    elif days_since < 365:
+        comp2 = 25.0
+    elif days_since < ACTIVITY_RING_RUST_DAYS:
+        comp2 = 15.0
+    elif days_since < 730:
+        comp2 = 8.0
+    else:
+        comp2 = 0.0
+
+    # Component 3: compared to weight class average
+    comp3 = 5.0  # default middle value
+    if wc_baselines:
+        wc = database.get_fighter_primary_weight_class(fighter_id)
+        if wc and wc in wc_baselines:
+            wc_avg = wc_baselines[wc].get("avg_fights_per_year", 2.0)
+            if wc_avg > 0:
+                wc_ratio = fights_per_year / wc_avg
+                comp3 = min(wc_ratio, 1.5) / 1.5 * 10.0
+
+    return _clamp(comp1 + comp2 + comp3)
+
+
+# ---------------------------------------------------------------------------
+# 5.7 Championship Modifier
 # ---------------------------------------------------------------------------
 
 def calc_championship_score(fighter_id: str) -> float:
@@ -361,17 +589,19 @@ def calc_championship_score(fighter_id: str) -> float:
 # 5.7 Final FQS
 # ---------------------------------------------------------------------------
 
-def calc_fqs(fighter_id: str, fqs_cache: dict | None = None) -> dict:
+def calc_fqs(fighter_id: str, fqs_cache: dict | None = None,
+             wc_baselines: dict | None = None) -> dict:
     """Calculate full FQS breakdown for a fighter.
 
     Returns dict with each sub-score and the final composite FQS.
     """
-    oq = calc_opponent_quality(fighter_id)
-    wm = calc_win_method_score(fighter_id)
+    oq = calc_opponent_quality(fighter_id, fqs_cache)
+    wm = calc_win_method_score(fighter_id, wc_baselines)
     lq = calc_loss_quality(fighter_id, fqs_cache)
     rc = calc_recency_score(fighter_id)
     st = calc_streak_score(fighter_id)
     ch = calc_championship_score(fighter_id)
+    ar = calc_activity_rate(fighter_id, wc_baselines)
 
     fqs = (
         oq * WEIGHT_OPPONENT_QUALITY
@@ -380,6 +610,7 @@ def calc_fqs(fighter_id: str, fqs_cache: dict | None = None) -> dict:
         + rc * WEIGHT_RECENCY
         + st * WEIGHT_STREAK
         + ch * WEIGHT_CHAMPIONSHIP
+        + ar * WEIGHT_ACTIVITY_RATE
     )
 
     return {
@@ -390,13 +621,14 @@ def calc_fqs(fighter_id: str, fqs_cache: dict | None = None) -> dict:
         "recency": round(rc, 1),
         "streak_momentum": round(st, 1),
         "championship": round(ch, 1),
+        "activity_rate": round(ar, 1),
     }
 
 
-def calc_all_fqs() -> dict[str, float]:
+def calc_all_fqs(wc_baselines: dict | None = None) -> dict[str, float]:
     """Calculate FQS for all fighters with iterative convergence.
 
-    Returns a dict mapping fighter_id → FQS value.
+    Returns a dict mapping fighter_id -> FQS value.
     """
     fighters = database.get_all_fighters()
     fqs_cache: dict[str, float] = {}
@@ -407,7 +639,7 @@ def calc_all_fqs() -> dict[str, float]:
         max_change = 0.0
 
         for f in fighters:
-            result = calc_fqs(f["id"], fqs_cache)
+            result = calc_fqs(f["id"], fqs_cache, wc_baselines)
             new_fqs = result["fqs"]
             old_fqs = fqs_cache.get(f["id"], 50.0)
             max_change = max(max_change, abs(new_fqs - old_fqs))

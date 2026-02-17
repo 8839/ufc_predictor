@@ -83,6 +83,18 @@ def init_db():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS weight_class_baselines (
+            weight_class TEXT PRIMARY KEY,
+            ko_rate REAL,
+            sub_rate REAL,
+            dec_rate REAL,
+            avg_finish_round REAL,
+            avg_fights_per_year REAL,
+            last_computed TEXT
+        )
+    """)
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fighter1_id TEXT REFERENCES fighters(id),
@@ -357,3 +369,63 @@ def get_prediction(prediction_id: int) -> dict | None:
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Weight Class Baselines
+# ---------------------------------------------------------------------------
+
+def get_fighter_primary_weight_class(fighter_id: str) -> str | None:
+    """Return the most frequent weight class for a fighter."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT weight_class, COUNT(*) as cnt
+        FROM fights
+        WHERE (fighter1_id = ? OR fighter2_id = ?) AND weight_class IS NOT NULL
+        GROUP BY weight_class
+        ORDER BY cnt DESC
+        LIMIT 1
+    """, (fighter_id, fighter_id)).fetchone()
+    conn.close()
+    return row["weight_class"] if row else None
+
+
+def get_fighter_fight_dates(fighter_id: str) -> list[str]:
+    """Return event dates for a fighter's fights, most recent first."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT event_date FROM fights
+        WHERE (fighter1_id = ? OR fighter2_id = ?) AND event_date IS NOT NULL
+        ORDER BY event_date DESC
+    """, (fighter_id, fighter_id)).fetchall()
+    conn.close()
+    return [r["event_date"] for r in rows]
+
+
+def upsert_weight_class_baseline(baseline: dict):
+    """Insert or update a weight class baseline record."""
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO weight_class_baselines (
+            weight_class, ko_rate, sub_rate, dec_rate,
+            avg_finish_round, avg_fights_per_year, last_computed
+        ) VALUES (
+            :weight_class, :ko_rate, :sub_rate, :dec_rate,
+            :avg_finish_round, :avg_fights_per_year, :last_computed
+        )
+        ON CONFLICT(weight_class) DO UPDATE SET
+            ko_rate=excluded.ko_rate, sub_rate=excluded.sub_rate,
+            dec_rate=excluded.dec_rate, avg_finish_round=excluded.avg_finish_round,
+            avg_fights_per_year=excluded.avg_fights_per_year,
+            last_computed=excluded.last_computed
+    """, baseline)
+    conn.commit()
+    conn.close()
+
+
+def get_all_weight_class_baselines() -> dict[str, dict]:
+    """Return all weight class baselines as {weight_class: {ko_rate, ...}}."""
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM weight_class_baselines").fetchall()
+    conn.close()
+    return {r["weight_class"]: dict(r) for r in rows}

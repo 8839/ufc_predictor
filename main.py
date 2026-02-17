@@ -13,6 +13,7 @@ from predictor import (
     predict_fight,
     save_prediction,
 )
+from scoring import compute_weight_class_baselines
 
 
 def cmd_scrape(args):
@@ -36,9 +37,12 @@ def cmd_predict(args):
     if not f2:
         sys.exit(1)
 
-    print(f"\nAnalyzing: {f1['name']} vs {f2['name']}...\n")
+    print(f"\nAnalyzing: {f1['name']} vs {f2['name']}...")
+    print("  Computing weight class baselines...")
+    wc_baselines = compute_weight_class_baselines()
+    print()
 
-    prediction = predict_fight(f1["id"], f2["id"])
+    prediction = predict_fight(f1["id"], f2["id"], wc_baselines=wc_baselines)
     output = format_prediction(prediction)
     print(output)
 
@@ -55,7 +59,10 @@ def cmd_fighter(args):
     if not fighter:
         sys.exit(1)
 
-    output = format_fighter_profile(fighter["id"])
+    print("  Computing weight class baselines...")
+    wc_baselines = compute_weight_class_baselines()
+
+    output = format_fighter_profile(fighter["id"], wc_baselines=wc_baselines)
     print(output)
 
 

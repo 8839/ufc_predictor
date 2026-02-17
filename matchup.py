@@ -2,6 +2,7 @@
 
 import database
 import utils
+from config import STYLE_EVOLUTION_THRESHOLD, STYLE_RECENT_FIGHT_COUNT
 from scoring import calc_fqs
 
 
@@ -55,11 +56,12 @@ def _aggregate_fight_stats(stats_list: list[dict]) -> dict:
 # 6.1 FQS Comparison
 # ---------------------------------------------------------------------------
 
-def fqs_comparison(f1_id: str, f2_id: str, fqs_cache: dict | None = None) -> dict:
+def fqs_comparison(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
+                   wc_baselines: dict | None = None) -> dict:
     """Return FQS breakdown for both fighters."""
     return {
-        "fighter1": calc_fqs(f1_id, fqs_cache),
-        "fighter2": calc_fqs(f2_id, fqs_cache),
+        "fighter1": calc_fqs(f1_id, fqs_cache, wc_baselines),
+        "fighter2": calc_fqs(f2_id, fqs_cache, wc_baselines),
     }
 
 
@@ -333,8 +335,11 @@ def common_opponent_analysis(f1_id: str, f2_id: str) -> dict:
 # 6.6 Style Classification & Matchup
 # ---------------------------------------------------------------------------
 
-def classify_style(fighter: dict) -> str:
+def classify_style(stats: dict) -> str:
     """Classify a fighter's primary style based on stat profile.
+
+    Accepts either a fighter dict (career stats keys) or a rate dict
+    with generic keys (slpm, td_avg, sub_avg, str_acc, str_def, td_def).
 
     Styles:
     - Wrestler: high takedown volume, uses wrestling to control
@@ -344,12 +349,12 @@ def classify_style(fighter: dict) -> str:
     - Pressure Fighter: high output everywhere, pushes pace
     - Counter Striker: lower output but high accuracy and defense
     """
-    slpm = fighter.get("sig_strikes_landed_per_min") or 0.0
-    td_avg = fighter.get("takedown_avg_per_15min") or 0.0
-    sub_avg = fighter.get("submission_avg_per_15min") or 0.0
-    str_acc = fighter.get("sig_strike_accuracy") or 0.0
-    str_def = fighter.get("sig_strike_defense") or 0.0
-    td_def = fighter.get("takedown_defense") or 0.0
+    # Support both fighter-dict keys and generic rate keys
+    slpm = stats.get("slpm") or stats.get("sig_strikes_landed_per_min") or 0.0
+    td_avg = stats.get("td_avg") or stats.get("takedown_avg_per_15min") or 0.0
+    sub_avg = stats.get("sub_avg") or stats.get("submission_avg_per_15min") or 0.0
+    str_acc = stats.get("str_acc") or stats.get("sig_strike_accuracy") or 0.0
+    str_def = stats.get("str_def") or stats.get("sig_strike_defense") or 0.0
 
     # Heavy wrestler — high TD volume is the primary indicator
     if td_avg >= 3.0:
@@ -381,13 +386,190 @@ def classify_style(fighter: dict) -> str:
     return "Balanced"
 
 
-def style_matchup_modifier(f1: dict, f2: dict) -> tuple[float, str]:
+def _recent_activity_profile(stats_list: list[dict]) -> dict | None:
+    """Compute the proportion of striking vs grappling in recent fights.
+
+    Returns {striking_share, grappling_share, sub_share} where each is 0-1,
+    or None if insufficient data.  Takedowns and submissions are weighted
+    by 10x to balance against the much higher absolute strike counts.
+    """
+    if not stats_list:
+        return None
+
+    total_sig = sum(s.get("sig_strikes_landed", 0) for s in stats_list)
+    total_td = sum(s.get("takedowns_landed", 0) for s in stats_list)
+    total_sub = sum(s.get("submission_attempts", 0) for s in stats_list)
+
+    # Weight grappling actions up so they're comparable to strike counts
+    weighted_td = total_td * 10
+    weighted_sub = total_sub * 10
+    total = total_sig + weighted_td + weighted_sub
+
+    if total == 0:
+        return None
+
+    return {
+        "striking_share": total_sig / total,
+        "grappling_share": weighted_td / total,
+        "sub_share": weighted_sub / total,
+    }
+
+
+def _career_activity_profile(fighter: dict) -> dict:
+    """Compute the proportion of striking vs grappling from career stats."""
+    slpm = fighter.get("sig_strikes_landed_per_min") or 0.0
+    td_avg = fighter.get("takedown_avg_per_15min") or 0.0
+    sub_avg = fighter.get("submission_avg_per_15min") or 0.0
+
+    # Normalize to same time base (per minute)
+    td_per_min = td_avg / 15.0
+    sub_per_min = sub_avg / 15.0
+
+    # Weight grappling up (same 10x as recent profile)
+    weighted_td = td_per_min * 10
+    weighted_sub = sub_per_min * 10
+    total = slpm + weighted_td + weighted_sub
+
+    if total == 0:
+        return {"striking_share": 0.5, "grappling_share": 0.25, "sub_share": 0.25}
+
+    return {
+        "striking_share": slpm / total,
+        "grappling_share": weighted_td / total,
+        "sub_share": weighted_sub / total,
+    }
+
+
+def _infer_recent_style(fighter: dict, recent_profile: dict,
+                        recent_fights: list[dict]) -> str:
+    """Infer recent style by scaling career stats by recent activity proportions.
+
+    Takes the fighter's career stat magnitudes but adjusts the balance
+    between striking/grappling/submissions based on recent fight proportions.
+    """
+    career_profile = _career_activity_profile(fighter)
+    slpm = fighter.get("sig_strikes_landed_per_min") or 0.0
+    td_avg = fighter.get("takedown_avg_per_15min") or 0.0
+    sub_avg = fighter.get("submission_avg_per_15min") or 0.0
+
+    # Compute shift ratios (how much each share changed)
+    if career_profile["striking_share"] > 0:
+        strike_shift = recent_profile["striking_share"] / career_profile["striking_share"]
+    else:
+        strike_shift = 1.0
+    if career_profile["grappling_share"] > 0:
+        grap_shift = recent_profile["grappling_share"] / career_profile["grappling_share"]
+    else:
+        grap_shift = 1.0
+    if career_profile["sub_share"] > 0:
+        sub_shift = recent_profile["sub_share"] / career_profile["sub_share"]
+    else:
+        sub_shift = 1.0
+
+    # Also factor in recent win methods
+    ko_wins = sum(1 for f in recent_fights
+                  if f.get("winner_id") == fighter["id"]
+                  and (f.get("win_method") or "") in ("KO/TKO",))
+    sub_wins = sum(1 for f in recent_fights
+                   if f.get("winner_id") == fighter["id"]
+                   and (f.get("win_method") or "") == "SUB")
+    total_recent_wins = sum(1 for f in recent_fights
+                           if f.get("winner_id") == fighter["id"])
+
+    # Boost shift if win methods reinforce the pattern
+    if total_recent_wins >= 2:
+        ko_rate = ko_wins / total_recent_wins
+        sub_rate = sub_wins / total_recent_wins
+        if ko_rate >= 0.6:
+            strike_shift *= 1.15
+        if sub_rate >= 0.4:
+            sub_shift *= 1.15
+
+    # Apply shifts to career stats
+    adjusted = {
+        "slpm": slpm * strike_shift,
+        "td_avg": td_avg * grap_shift,
+        "sub_avg": sub_avg * sub_shift,
+        "str_acc": fighter.get("sig_strike_accuracy") or 0.0,
+        "str_def": fighter.get("sig_strike_defense") or 0.0,
+    }
+
+    return classify_style(adjusted)
+
+
+def detect_style_evolution(fighter: dict) -> dict:
+    """Detect whether a fighter's style has evolved recently.
+
+    Uses proportion-based comparison: compares the balance of striking vs
+    grappling in recent fights to the career average.  Avoids unreliable
+    per-minute rate conversions from raw fight stats.
+
+    Returns dict with:
+      career_style, recent_style, has_evolved, effective_style, evolution_note
+    """
+    career_style = classify_style(fighter)
+    no_evolution = {
+        "career_style": career_style,
+        "recent_style": career_style,
+        "has_evolved": False,
+        "effective_style": career_style,
+        "evolution_note": None,
+    }
+
+    fights = database.get_fighter_fights(fighter["id"])
+    recent_fights = fights[:STYLE_RECENT_FIGHT_COUNT]
+
+    if len(recent_fights) < 3:
+        return no_evolution
+
+    # Gather fight stats for recent fights
+    stats_list = []
+    for fight in recent_fights:
+        s = database.get_fight_stats(fight["id"], fighter["id"])
+        if s:
+            stats_list.append(s)
+
+    if len(stats_list) < 3:
+        return no_evolution
+
+    recent_profile = _recent_activity_profile(stats_list)
+    if not recent_profile:
+        return no_evolution
+
+    career_profile = _career_activity_profile(fighter)
+
+    # Check if proportions shifted significantly
+    strike_delta = abs(recent_profile["striking_share"] - career_profile["striking_share"])
+    grap_delta = abs(recent_profile["grappling_share"] - career_profile["grappling_share"])
+    max_delta = max(strike_delta, grap_delta)
+
+    if max_delta < STYLE_EVOLUTION_THRESHOLD:
+        return no_evolution
+
+    recent_style = _infer_recent_style(fighter, recent_profile, recent_fights)
+
+    if recent_style == career_style:
+        return no_evolution
+
+    return {
+        "career_style": career_style,
+        "recent_style": recent_style,
+        "has_evolved": True,
+        "effective_style": recent_style,
+        "evolution_note": f"{career_style} -> {recent_style}",
+    }
+
+
+def style_matchup_modifier(f1: dict, f2: dict,
+                           f1_evolution: dict | None = None,
+                           f2_evolution: dict | None = None) -> tuple[float, str]:
     """Return a probability adjustment and description for the style matchup.
 
     Positive value favors fighter 1, negative favors fighter 2.
+    Uses effective_style from evolution data when available.
     """
-    s1 = classify_style(f1)
-    s2 = classify_style(f2)
+    s1 = f1_evolution["effective_style"] if f1_evolution else classify_style(f1)
+    s2 = f2_evolution["effective_style"] if f2_evolution else classify_style(f2)
 
     adjustment = 0.0
     description = f"{s1} vs {s2}"
@@ -442,17 +624,27 @@ def style_matchup_modifier(f1: dict, f2: dict) -> tuple[float, str]:
     return adjustment, description
 
 
-def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None) -> dict:
+def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
+                 wc_baselines: dict | None = None) -> dict:
     """Run all matchup analyses and return combined results."""
     f1 = database.get_fighter(f1_id)
     f2 = database.get_fighter(f2_id)
 
-    fqs = fqs_comparison(f1_id, f2_id, fqs_cache)
+    fqs = fqs_comparison(f1_id, f2_id, fqs_cache, wc_baselines)
     striking = striking_analysis(f1, f2)
     grappling = grappling_analysis(f1, f2)
     physical = physical_analysis(f1, f2)
     common = common_opponent_analysis(f1_id, f2_id)
-    style_adj, style_desc = style_matchup_modifier(f1, f2)
+
+    # Style evolution detection
+    f1_evolution = detect_style_evolution(f1)
+    f2_evolution = detect_style_evolution(f2)
+
+    style_adj, style_desc = style_matchup_modifier(f1, f2, f1_evolution, f2_evolution)
+
+    # Weight class info
+    f1_wc = database.get_fighter_primary_weight_class(f1_id)
+    f2_wc = database.get_fighter_primary_weight_class(f2_id)
 
     return {
         "fighter1": f1,
@@ -464,6 +656,10 @@ def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None) -> dict:
         "common_opponents": common,
         "style_adjustment": style_adj,
         "style_description": style_desc,
-        "fighter1_style": classify_style(f1),
-        "fighter2_style": classify_style(f2),
+        "fighter1_style": f1_evolution["effective_style"],
+        "fighter2_style": f2_evolution["effective_style"],
+        "fighter1_evolution": f1_evolution,
+        "fighter2_evolution": f2_evolution,
+        "fighter1_weight_class": f1_wc,
+        "fighter2_weight_class": f2_wc,
     }

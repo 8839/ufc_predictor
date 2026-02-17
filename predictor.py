@@ -4,16 +4,17 @@ from datetime import datetime
 
 import database
 import utils
-from config import MAX_PROBABILITY, MIN_PROBABILITY
+from config import MAX_PROBABILITY, MIN_PROBABILITY, OVERALL_KO_RATE, OVERALL_SUB_RATE
 from matchup import full_matchup
 
 
-def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None) -> dict:
+def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
+                  wc_baselines: dict | None = None) -> dict:
     """Generate a full fight prediction.
 
     Returns a dict with all matchup data plus prediction details.
     """
-    analysis = full_matchup(f1_id, f2_id, fqs_cache)
+    analysis = full_matchup(f1_id, f2_id, fqs_cache, wc_baselines)
     f1 = analysis["fighter1"]
     f2 = analysis["fighter2"]
     fqs = analysis["fqs"]
@@ -108,7 +109,8 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None) -> dict
         win_prob = 1.0 - final_prob
 
     # 7.2 Predicted method of victory
-    method, round_range = _predict_method(winner_id, loser["id"])
+    weight_class = analysis.get("fighter1_weight_class") or analysis.get("fighter2_weight_class")
+    method, round_range = _predict_method(winner_id, loser["id"], weight_class, wc_baselines)
 
     # 7.3 Confidence label
     label = utils.confidence_label(win_prob)
@@ -146,8 +148,13 @@ def _is_decision(method: str) -> bool:
     return "DEC" in method
 
 
-def _predict_method(winner_id: str, loser_id: str) -> tuple[str, str]:
-    """Predict method of victory and approximate round range."""
+def _predict_method(winner_id: str, loser_id: str,
+                    weight_class: str | None = None,
+                    wc_baselines: dict | None = None) -> tuple[str, str]:
+    """Predict method of victory and approximate round range.
+
+    Blends fighter rates with weight-class tendencies (80/20) when available.
+    """
     fights = database.get_fighter_fights(winner_id)
 
     ko_count = 0
@@ -171,7 +178,6 @@ def _predict_method(winner_id: str, loser_id: str) -> tuple[str, str]:
                 finish_rounds.append(fight["finish_round"])
         elif _is_decision(method):
             dec_count += 1
-        # DQ, CNC, Overturned, etc. don't count toward method rates
 
     if total_wins == 0:
         return "Decision - Unanimous", "Round 3"
@@ -202,10 +208,16 @@ def _predict_method(winner_id: str, loser_id: str) -> tuple[str, str]:
         ko_rate = ko_rate * 0.7 + loser_ko_vuln * 0.3
         sub_rate = sub_rate * 0.7 + loser_sub_vuln * 0.3
 
-    # Determine method — if the winner finishes most fights, predict a finish
-    # even if decision is technically the plurality method
+    # Blend with weight-class tendencies (80% fighter, 20% WC)
+    if wc_baselines and weight_class and weight_class in wc_baselines:
+        bl = wc_baselines[weight_class]
+        wc_ko = bl.get("ko_rate", OVERALL_KO_RATE)
+        wc_sub = bl.get("sub_rate", OVERALL_SUB_RATE)
+        ko_rate = ko_rate * 0.8 + wc_ko * 0.2
+        sub_rate = sub_rate * 0.8 + wc_sub * 0.2
+
+    # Determine method
     if finish_rate >= 0.5:
-        # This fighter finishes more than half the time — pick the dominant finish type
         if ko_rate >= sub_rate:
             predicted = "KO/TKO"
         else:
@@ -321,6 +333,7 @@ def format_prediction(pred: dict) -> str:
         ("Recency", "recency"),
         ("Momentum", "streak_momentum"),
         ("Championship", "championship"),
+        ("Activity Rate", "activity_rate"),
     ]:
         lines.append(
             f"    {label + ':':<20} {fqs1[key]:<10}       "
@@ -382,9 +395,17 @@ def format_prediction(pred: dict) -> str:
 
     # Style
     lines.append(f"\n  STYLE MATCHUP:    {pred['analysis']['style_description']}")
+    f1_evo = pred["analysis"].get("fighter1_evolution")
+    f2_evo = pred["analysis"].get("fighter2_evolution")
+    f1_style_str = pred["analysis"]["fighter1_style"]
+    f2_style_str = pred["analysis"]["fighter2_style"]
+    if f1_evo and f1_evo.get("has_evolved"):
+        f1_style_str = f"{f1_evo['career_style']} -> {f1_evo['recent_style']} (evolving)"
+    if f2_evo and f2_evo.get("has_evolved"):
+        f2_style_str = f"{f2_evo['career_style']} -> {f2_evo['recent_style']} (evolving)"
     lines.append(
-        f"    {f1['name']}: {pred['analysis']['fighter1_style']} | "
-        f"{f2['name']}: {pred['analysis']['fighter2_style']}"
+        f"    {f1['name']}: {f1_style_str} | "
+        f"{f2['name']}: {f2_style_str}"
     )
 
     lines.append("")
@@ -417,18 +438,24 @@ def format_prediction(pred: dict) -> str:
     return "\n".join(lines)
 
 
-def format_fighter_profile(fighter_id: str, fqs_cache: dict | None = None) -> str:
+def format_fighter_profile(fighter_id: str, fqs_cache: dict | None = None,
+                          wc_baselines: dict | None = None) -> str:
     """Format a single fighter's profile with FQS breakdown."""
     from scoring import calc_fqs
+    from matchup import detect_style_evolution, classify_style
 
     f = database.get_fighter(fighter_id)
     if not f:
         return f"Fighter {fighter_id} not found."
 
-    fqs = calc_fqs(fighter_id, fqs_cache)
+    fqs = calc_fqs(fighter_id, fqs_cache, wc_baselines)
     age = utils.calculate_age(f.get("dob"))
     height = utils.format_height(f.get("height_inches"))
     fights = database.get_fighter_fights(fighter_id)
+    wc = database.get_fighter_primary_weight_class(fighter_id)
+
+    # Style evolution
+    evolution = detect_style_evolution(f)
 
     lines = []
     w = 50
@@ -441,6 +468,13 @@ def format_fighter_profile(fighter_id: str, fqs_cache: dict | None = None) -> st
         lines.append(f"  No Contests: {f['no_contests']}")
     lines.append(f"  Age: {age or 'N/A'} | Height: {height} | Reach: {f.get('reach_inches', 'N/A')}\"")
     lines.append(f"  Stance: {f.get('stance', 'N/A')} | Weight: {f.get('weight_lbs', 'N/A')} lbs")
+    if wc:
+        lines.append(f"  Weight Class: {wc}")
+    # Style
+    style_str = evolution["effective_style"]
+    if evolution["has_evolved"]:
+        style_str = f"{evolution['career_style']} -> {evolution['recent_style']} (evolving)"
+    lines.append(f"  Style: {style_str}")
     lines.append("-" * w)
     lines.append("  FQS BREAKDOWN")
     lines.append(f"    Overall FQS:     {fqs['fqs']}")
@@ -450,6 +484,7 @@ def format_fighter_profile(fighter_id: str, fqs_cache: dict | None = None) -> st
     lines.append(f"    Recency:          {fqs['recency']}")
     lines.append(f"    Momentum:         {fqs['streak_momentum']}")
     lines.append(f"    Championship:     {fqs['championship']}")
+    lines.append(f"    Activity Rate:    {fqs['activity_rate']}")
     lines.append("-" * w)
     lines.append("  CAREER STATS")
     lines.append(f"    Sig. Strikes/Min: {f.get('sig_strikes_landed_per_min', 'N/A')}")
