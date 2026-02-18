@@ -22,8 +22,10 @@ def cmd_scrape(args):
         scraper.full_scrape()
     elif args.refresh:
         scraper.refresh_scrape()
+    elif args.fight_stats:
+        scraper.rescrape_fight_stats()
     else:
-        print("Specify --full or --refresh. Use --help for details.")
+        print("Specify --full, --refresh, or --fight-stats. Use --help for details.")
 
 
 def cmd_predict(args):
@@ -108,6 +110,10 @@ def main():
     scrape_group.add_argument("--full", action="store_true", help="Full database build")
     scrape_group.add_argument(
         "--refresh", action="store_true", help="Incremental refresh"
+    )
+    scrape_group.add_argument(
+        "--fight-stats", action="store_true",
+        help="Re-scrape only fight stats (fixes bad data without full rebuild)"
     )
     scrape_parser.set_defaults(func=cmd_scrape)
 

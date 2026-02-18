@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 import database
 import utils
-from config import BASE_URL, REQUEST_DELAY, REFRESH_WINDOW_DAYS
+from config import BASE_URL, REQUEST_DELAY, REFRESH_WINDOW_DAYS, MIN_SIG_STRIKES_PER_ROUND
 
 
 SESSION = requests.Session()
@@ -23,7 +23,9 @@ def _get(url: str) -> BeautifulSoup:
     time.sleep(REQUEST_DELAY)
     resp = SESSION.get(url, timeout=30)
     resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+    resp.close()
+    return BeautifulSoup(html, "html.parser")
 
 
 # ---------------------------------------------------------------------------
@@ -282,24 +284,129 @@ def scrape_event_detail(event_id: str, event_name: str, event_date: str) -> list
 # Fight Detail (round-by-round stats)
 # ---------------------------------------------------------------------------
 
+def _parse_stats_row(fight_id: str, cols, fighter_idx: int,
+                     fighter_id: str) -> dict:
+    """Parse a single stats row for one fighter (by index 0 or 1)."""
+    def _get_col_text(col_idx):
+        ps = cols[col_idx].select("p")
+        if fighter_idx < len(ps):
+            return ps[fighter_idx].get_text(strip=True)
+        return ""
+
+    kd = _get_col_text(1)
+    sig_str = _get_col_text(2)
+    total_str = _get_col_text(4)
+    td_str = _get_col_text(5)
+    sub_att = _get_col_text(7)
+    rev = _get_col_text(8)
+    ctrl = _get_col_text(9)
+
+    sig_landed, sig_attempted = utils.parse_strikes(sig_str)
+    total_landed, total_attempted = utils.parse_strikes(total_str)
+    td_landed, td_attempted = utils.parse_strikes(td_str)
+
+    return {
+        "fight_id": fight_id,
+        "fighter_id": fighter_id,
+        "knockdowns": int(kd) if kd.isdigit() else 0,
+        "sig_strikes_landed": sig_landed,
+        "sig_strikes_attempted": sig_attempted,
+        "total_strikes_landed": total_landed,
+        "total_strikes_attempted": total_attempted,
+        "takedowns_landed": td_landed,
+        "takedowns_attempted": td_attempted,
+        "submission_attempts": int(sub_att) if sub_att.isdigit() else 0,
+        "reversals": int(rev) if rev.isdigit() else 0,
+        "control_time_seconds": utils.parse_control_time(ctrl),
+    }
+
+
+def _sum_per_round_rows(fight_id: str, rows, fighter_links: list) -> list[dict]:
+    """Sum all per-round rows as a fallback when the totals row is suspect."""
+    fighter_ids = [
+        link.get("href", "").rstrip("/").split("/")[-1]
+        for link in fighter_links[:2]
+    ]
+
+    accum = [{
+        "fight_id": fight_id,
+        "fighter_id": fid,
+        "knockdowns": 0,
+        "sig_strikes_landed": 0, "sig_strikes_attempted": 0,
+        "total_strikes_landed": 0, "total_strikes_attempted": 0,
+        "takedowns_landed": 0, "takedowns_attempted": 0,
+        "submission_attempts": 0, "reversals": 0,
+        "control_time_seconds": 0,
+    } for fid in fighter_ids]
+
+    for row in rows:
+        cols = row.select("td")
+        if len(cols) < 10:
+            continue
+        for i, fid in enumerate(fighter_ids):
+            parsed = _parse_stats_row(fight_id, cols, i, fid)
+            for key in accum[i]:
+                if key in ("fight_id", "fighter_id"):
+                    continue
+                accum[i][key] += parsed[key]
+
+    return accum
+
+
 def scrape_fight_detail(fight_id: str) -> list[dict]:
-    """Scrape round-by-round stats for a fight. Returns two stat dicts (one per fighter)."""
+    """Scrape round-by-round stats for a fight. Returns two stat dicts (one per fighter).
+
+    The totals table on UFCStats has NO CSS class, while the per-round
+    breakdown tables have class 'js-fight-table'. We select the first
+    classless <table> with 10 columns and fighter links as the totals.
+    Falls back to summing the per-round js-fight-table rows if the
+    totals table isn't found.
+    """
     url = f"{BASE_URL}/fight-details/{fight_id}"
     soup = _get(url)
 
-    totals_section = soup.select("table.b-fight-details__table.js-fight-table")
-    if not totals_section:
+    all_tables = soup.select("table")
+    if not all_tables:
         return []
 
-    # The first table contains the totals row
-    table = totals_section[0]
+    # The totals table has NO CSS class, 1 row, 10 columns, and fighter links.
+    # The per-round tables have class 'js-fight-table' with N rows (one per round).
+    totals_table = None
+    for table in all_tables:
+        if table.get("class"):
+            continue  # skip tables with any CSS class (per-round tables)
+        rows = table.select("tbody tr")
+        if not rows:
+            continue
+        cols = rows[0].select("td")
+        if len(cols) == 10 and cols[0].select("a"):
+            totals_table = table
+            break
+
+    if totals_table is not None:
+        row = totals_table.select("tbody tr")[0]
+        cols = row.select("td")
+        fighter_links = cols[0].select("a")
+        if len(fighter_links) < 2:
+            return []
+
+        stats_list = []
+        for i, link in enumerate(fighter_links[:2]):
+            fid = link.get("href", "").rstrip("/").split("/")[-1]
+            stats_list.append(_parse_stats_row(fight_id, cols, i, fid))
+        return stats_list
+
+    # Fallback: no classless totals table found — sum per-round rows
+    per_round_tables = soup.select("table.js-fight-table")
+    if not per_round_tables:
+        return []
+
+    table = per_round_tables[0]
     rows = table.select("tbody tr")
     if not rows:
         return []
 
-    # Get fighter IDs from links in the first totals row
-    first_row = rows[0]
-    cols = first_row.select("td")
+    cols = rows[0].select("td")
     if len(cols) < 10:
         return []
 
@@ -307,45 +414,7 @@ def scrape_fight_detail(fight_id: str) -> list[dict]:
     if len(fighter_links) < 2:
         return []
 
-    stats_list = []
-    for i, link in enumerate(fighter_links[:2]):
-        fighter_id = link.get("href", "").rstrip("/").split("/")[-1]
-
-        # Each fighter has a <p> in each column — first <p> = fighter 1, second = fighter 2
-        def _get_col_text(col_idx):
-            ps = cols[col_idx].select("p")
-            if i < len(ps):
-                return ps[i].get_text(strip=True)
-            return ""
-
-        kd = _get_col_text(1)
-        sig_str = _get_col_text(2)
-        total_str = _get_col_text(4)
-        td_str = _get_col_text(5)
-        sub_att = _get_col_text(7)
-        rev = _get_col_text(8)
-        ctrl = _get_col_text(9)
-
-        sig_landed, sig_attempted = utils.parse_strikes(sig_str)
-        total_landed, total_attempted = utils.parse_strikes(total_str)
-        td_landed, td_attempted = utils.parse_strikes(td_str)
-
-        stats_list.append({
-            "fight_id": fight_id,
-            "fighter_id": fighter_id,
-            "knockdowns": int(kd) if kd.isdigit() else 0,
-            "sig_strikes_landed": sig_landed,
-            "sig_strikes_attempted": sig_attempted,
-            "total_strikes_landed": total_landed,
-            "total_strikes_attempted": total_attempted,
-            "takedowns_landed": td_landed,
-            "takedowns_attempted": td_attempted,
-            "submission_attempts": int(sub_att) if sub_att.isdigit() else 0,
-            "reversals": int(rev) if rev.isdigit() else 0,
-            "control_time_seconds": utils.parse_control_time(ctrl),
-        })
-
-    return stats_list
+    return _sum_per_round_rows(fight_id, rows, fighter_links)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +474,54 @@ def full_scrape():
             _print(f"  Warning: failed to scrape fight stats {fid}: {e}")
 
     _print("\n=== FULL SCRAPE COMPLETE ===\n")
+
+
+def rescrape_fight_stats(batch_size: int = 500, skip: int = 0):
+    """Re-scrape only fight stats pages (not fighters or events).
+
+    Useful when the fight stats parser has been fixed and existing
+    data needs to be corrected without a full multi-hour scrape.
+    Processes fights in batches with GC between them to avoid
+    memory pressure / segfaults from accumulated BeautifulSoup objects.
+
+    Args:
+        batch_size: Force GC every N fights.
+        skip: Number of fights to skip (for resuming after a crash).
+    """
+    import gc
+
+    database.init_db()
+    conn = database.get_connection()
+    fight_ids = [
+        row["id"] for row in
+        conn.execute("SELECT id FROM fights ORDER BY event_date DESC").fetchall()
+    ]
+    conn.close()
+
+    total = len(fight_ids)
+    if skip:
+        fight_ids = fight_ids[skip:]
+        _print(f"\n=== RESCRAPE FIGHT STATS (resuming from {skip}, {len(fight_ids)} remaining of {total}) ===\n")
+    else:
+        _print(f"\n=== RESCRAPE FIGHT STATS ({total} fights) ===\n")
+
+    errors = 0
+    remaining = len(fight_ids)
+    for i, fid in enumerate(fight_ids, 1):
+        if i % 100 == 0:
+            _print(f"  {skip + i}/{total} fight stats scraped... ({errors} errors)")
+        if i % batch_size == 0:
+            gc.collect()
+        try:
+            stats = scrape_fight_detail(fid)
+            for s in stats:
+                database.upsert_fight_stats(s)
+        except Exception as e:
+            errors += 1
+            if errors <= 10:
+                _print(f"  Warning: fight stats {fid}: {e}")
+
+    _print(f"\n=== RESCRAPE COMPLETE ({remaining - errors}/{remaining} succeeded) ===\n")
 
 
 def refresh_scrape():

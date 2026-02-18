@@ -4,7 +4,11 @@ from datetime import datetime
 
 import database
 import utils
-from config import MAX_PROBABILITY, MIN_PROBABILITY, OVERALL_KO_RATE, OVERALL_SUB_RATE
+from config import (
+    MAX_PROBABILITY, MIN_PROBABILITY, OVERALL_KO_RATE, OVERALL_SUB_RATE,
+    PREDICTION_STRIKING_ADJ, PREDICTION_GRAPPLING_ADJ,
+    PREDICTION_PHYSICAL_ADJ, PREDICTION_COMMON_OPP_ADJ,
+)
 from matchup import full_matchup
 
 
@@ -35,9 +39,9 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
     # Striking edge
     striking = analysis["striking"]
     if striking["edge_id"] == f1_id:
-        adj = 0.03
+        adj = PREDICTION_STRIKING_ADJ
     elif striking["edge_id"] == f2_id:
-        adj = -0.03
+        adj = -PREDICTION_STRIKING_ADJ
     else:
         adj = 0.0
     adjustments.append(("Striking edge", adj))
@@ -45,9 +49,9 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
     # Grappling edge
     grappling = analysis["grappling"]
     if grappling["edge_id"] == f1_id:
-        adj = 0.03
+        adj = PREDICTION_GRAPPLING_ADJ
     elif grappling["edge_id"] == f2_id:
-        adj = -0.03
+        adj = -PREDICTION_GRAPPLING_ADJ
     else:
         adj = 0.0
     adjustments.append(("Grappling edge", adj))
@@ -55,9 +59,9 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
     # Physical advantages
     physical = analysis["physical"]
     if physical["edge_id"] == f1_id:
-        adj = 0.02
+        adj = PREDICTION_PHYSICAL_ADJ
     elif physical["edge_id"] == f2_id:
-        adj = -0.02
+        adj = -PREDICTION_PHYSICAL_ADJ
     else:
         adj = 0.0
     adjustments.append(("Physical edge", adj))
@@ -65,9 +69,9 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
     # Common opponent advantage
     common = analysis["common_opponents"]
     if common["edge_id"] == f1_id:
-        adj = 0.025
+        adj = PREDICTION_COMMON_OPP_ADJ
     elif common["edge_id"] == f2_id:
-        adj = -0.025
+        adj = -PREDICTION_COMMON_OPP_ADJ
     else:
         adj = 0.0
     adjustments.append(("Common opponents", adj))
@@ -75,6 +79,16 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
     # Style matchup
     style_adj = analysis["style_adjustment"]
     adjustments.append(("Style matchup", style_adj))
+
+    # Age factor
+    age_data = analysis.get("age")
+    if age_data:
+        adjustments.append(("Age factor", age_data["adjustment"]))
+
+    # Stance matchup
+    stance_adj = analysis.get("stance_adjustment", 0.0)
+    if stance_adj:
+        adjustments.append(("Stance matchup", stance_adj))
 
     # Momentum/streak
     streak_diff = fqs["fighter1"]["streak_momentum"] - fqs["fighter2"]["streak_momentum"]
@@ -377,10 +391,31 @@ def format_prediction(pred: dict) -> str:
     if phys_parts:
         lines.append(f"    {' | '.join(phys_parts)}")
 
-    if f1_age and f1_age > 37:
-        lines.append(f"    * {f1['name']} is {f1_age} (statistical decline zone)")
-    if f2_age and f2_age > 37:
-        lines.append(f"    * {f2['name']} is {f2_age} (statistical decline zone)")
+    # Age analysis
+    age_data = pred["analysis"].get("age")
+    if age_data:
+        f1_factor = age_data["fighter1_factor"]
+        f2_factor = age_data["fighter2_factor"]
+        f1_astyle = age_data["fighter1_style"]
+        f2_astyle = age_data["fighter2_style"]
+        age_adj = age_data["adjustment"]
+        lines.append(f"\n  AGE ANALYSIS:")
+        lines.append(
+            f"    {f1['name']}: age {age_data['fighter1_age'] or 'N/A'}, "
+            f"factor {f1_factor:.2f} ({f1_astyle})"
+        )
+        lines.append(
+            f"    {f2['name']}: age {age_data['fighter2_age'] or 'N/A'}, "
+            f"factor {f2_factor:.2f} ({f2_astyle})"
+        )
+        if abs(age_adj) > 0.005:
+            favored = f1["name"] if age_adj > 0 else f2["name"]
+            lines.append(f"    Age advantage: {favored} ({age_adj*100:+.1f}%)")
+
+    # Stance matchup
+    stance_desc = pred["analysis"].get("stance_description", "")
+    if stance_desc:
+        lines.append(f"\n  STANCE MATCHUP:   {stance_desc}")
 
     # Common opponents
     f1_last = f1["name"].split()[-1]
@@ -457,6 +492,11 @@ def format_fighter_profile(fighter_id: str, fqs_cache: dict | None = None,
     # Style evolution
     evolution = detect_style_evolution(f)
 
+    # Age factor
+    from matchup import compute_age_factor
+    eff_style = evolution["effective_style"]
+    age_factor = compute_age_factor(age, eff_style)
+
     lines = []
     w = 50
     lines.append("=" * w)
@@ -466,7 +506,9 @@ def format_fighter_profile(fighter_id: str, fqs_cache: dict | None = None,
     lines.append(f"  Record: {f.get('wins', 0)}-{f.get('losses', 0)}-{f.get('draws', 0)}")
     if f.get("no_contests"):
         lines.append(f"  No Contests: {f['no_contests']}")
-    lines.append(f"  Age: {age or 'N/A'} | Height: {height} | Reach: {f.get('reach_inches', 'N/A')}\"")
+    age_str = f"{age}" if age else "N/A"
+    age_factor_str = f" (age factor: {age_factor:.2f})" if age else ""
+    lines.append(f"  Age: {age_str}{age_factor_str} | Height: {height} | Reach: {f.get('reach_inches', 'N/A')}\"")
     lines.append(f"  Stance: {f.get('stance', 'N/A')} | Weight: {f.get('weight_lbs', 'N/A')} lbs")
     if wc:
         lines.append(f"  Weight Class: {wc}")

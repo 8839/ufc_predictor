@@ -29,7 +29,7 @@ OVERALL_SUB_RATE = 0.198
 OVERALL_DEC_RATE = 0.470
 
 # Style evolution
-STYLE_EVOLUTION_THRESHOLD = 0.40
+STYLE_EVOLUTION_THRESHOLD = 0.25  # lowered from 0.40 — was too strict (zero fighters triggered)
 STYLE_RECENT_FIGHT_COUNT = 5
 
 # Win Method Points (keys match actual DB values from UFCStats)
@@ -60,3 +60,36 @@ REFRESH_WINDOW_DAYS = 90
 
 # Fuzzy match threshold
 FUZZY_MATCH_THRESHOLD = 80
+
+# Age decline curve
+AGE_PEAK_START = 28
+AGE_PEAK_END = 32
+AGE_GRADUAL_DECLINE_END = 35
+AGE_STEEP_DECLINE_END = 38
+AGE_FACTOR_FLOOR = 0.55
+AGE_DECLINE_STYLE_MODIFIERS = {
+    "Wrestler": 0.60,         # wrestlers age best (technique/control)
+    "Grappler": 0.65,
+    "Wrestle-Striker": 0.70,
+    "Balanced": 0.80,
+    "Pressure Fighter": 0.85, # cardio-dependent
+    "Striker": 0.90,          # speed-dependent
+    "Counter Striker": 0.95,  # reflex-dependent, ages worst
+}
+AGE_ADJUSTMENT_SCALE = 0.12
+AGE_ADJUSTMENT_MAX = 0.06    # cap at +/-6%
+
+# Stance matchup
+STANCE_SOUTHPAW_VS_ORTHODOX = 0.020
+STANCE_SWITCH_VS_ORTHODOX = 0.015
+STANCE_SWITCH_VS_SOUTHPAW = 0.010
+STANCE_STRIKER_AMPLIFIER = 1.5   # amplify in striker vs striker
+
+# Prediction adjustments (widened from V2 hardcoded values)
+PREDICTION_STRIKING_ADJ = 0.04    # was 0.03
+PREDICTION_GRAPPLING_ADJ = 0.04   # was 0.03
+PREDICTION_PHYSICAL_ADJ = 0.025   # was 0.02
+PREDICTION_COMMON_OPP_ADJ = 0.03  # was 0.025
+
+# Scraper validation
+MIN_SIG_STRIKES_PER_ROUND = 5

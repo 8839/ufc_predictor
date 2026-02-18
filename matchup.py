@@ -2,7 +2,14 @@
 
 import database
 import utils
-from config import STYLE_EVOLUTION_THRESHOLD, STYLE_RECENT_FIGHT_COUNT
+from config import (
+    STYLE_EVOLUTION_THRESHOLD, STYLE_RECENT_FIGHT_COUNT,
+    AGE_PEAK_START, AGE_PEAK_END, AGE_GRADUAL_DECLINE_END,
+    AGE_STEEP_DECLINE_END, AGE_FACTOR_FLOOR, AGE_DECLINE_STYLE_MODIFIERS,
+    AGE_ADJUSTMENT_SCALE, AGE_ADJUSTMENT_MAX,
+    STANCE_SOUTHPAW_VS_ORTHODOX, STANCE_SWITCH_VS_ORTHODOX,
+    STANCE_SWITCH_VS_SOUTHPAW, STANCE_STRIKER_AMPLIFIER,
+)
 from scoring import calc_fqs
 
 
@@ -101,9 +108,18 @@ def striking_analysis(f1: dict, f2: dict) -> dict:
     else:
         f2_acc_blend = f2_acc
 
-    # Determine edge: higher output, accuracy, defense; lower absorbed; knockdown power
-    f1_score = f1_slpm + f1_acc_blend * 10 + f1_def * 10 - f1_sapm + f1_kd_rate * 3
-    f2_score = f2_slpm + f2_acc_blend * 10 + f2_def * 10 - f2_sapm + f2_kd_rate * 3
+    # Grappling context: fighters with high TD avg spend more time grappling,
+    # so their lower SLpM reflects less striking time, not worse striking.
+    # Boost effective SLpM proportionally to takedown activity.
+    f1_td_avg = f1.get("takedown_avg_per_15min") or 0.0
+    f2_td_avg = f2.get("takedown_avg_per_15min") or 0.0
+    f1_slpm_adj = f1_slpm * (1.0 + f1_td_avg * 0.08)
+    f2_slpm_adj = f2_slpm * (1.0 + f2_td_avg * 0.08)
+
+    # Determine edge: higher output (grappling-adjusted), accuracy, defense; lower absorbed
+    # KD power is handled as a separate adjustment in predictor.py to avoid double-counting
+    f1_score = f1_slpm_adj + f1_acc_blend * 10 + f1_def * 10 - f1_sapm
+    f2_score = f2_slpm_adj + f2_acc_blend * 10 + f2_def * 10 - f2_sapm
 
     edge = f1["name"] if f1_score >= f2_score else f2["name"]
     edge_id = f1["id"] if f1_score >= f2_score else f2["id"]
@@ -211,6 +227,125 @@ def _avg_control_time(fighter_id: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 6.4a Age Decline Curve
+# ---------------------------------------------------------------------------
+
+def compute_age_factor(age: int | None, style: str) -> float:
+    """Compute age factor (0.55-1.0) using a piecewise linear decline curve.
+
+    Peak at 28-32 (factor=1.0), gradual decline 33-35 (-0.02/yr),
+    steep 36-38 (-0.03/yr), severe 39+ (-0.04/yr).
+    Style modifies only the decline portion.
+    """
+    if age is None:
+        return 0.95  # conservative default
+
+    if age <= AGE_PEAK_END:
+        return 1.0
+
+    style_mod = AGE_DECLINE_STYLE_MODIFIERS.get(style, 0.80)
+
+    if age <= AGE_GRADUAL_DECLINE_END:
+        years_past = age - AGE_PEAK_END
+        raw_decline = years_past * 0.02
+    elif age <= AGE_STEEP_DECLINE_END:
+        gradual_years = AGE_GRADUAL_DECLINE_END - AGE_PEAK_END  # 3 years
+        steep_years = age - AGE_GRADUAL_DECLINE_END
+        raw_decline = gradual_years * 0.02 + steep_years * 0.03
+    else:
+        gradual_years = AGE_GRADUAL_DECLINE_END - AGE_PEAK_END  # 3 years
+        steep_years = AGE_STEEP_DECLINE_END - AGE_GRADUAL_DECLINE_END  # 3 years
+        severe_years = age - AGE_STEEP_DECLINE_END
+        raw_decline = gradual_years * 0.02 + steep_years * 0.03 + severe_years * 0.04
+
+    adjusted_decline = raw_decline * style_mod
+    factor = max(AGE_FACTOR_FLOOR, 1.0 - adjusted_decline)
+    return round(factor, 3)
+
+
+def age_matchup_analysis(f1: dict, f2: dict,
+                         f1_style: str, f2_style: str) -> dict:
+    """Compute age factors for both fighters and return matchup adjustment.
+
+    Returns dict with age factors, ages, and a clamped adjustment value.
+    Positive adjustment favors fighter 1.
+    """
+    f1_age = utils.calculate_age(f1.get("dob"))
+    f2_age = utils.calculate_age(f2.get("dob"))
+
+    f1_factor = compute_age_factor(f1_age, f1_style)
+    f2_factor = compute_age_factor(f2_age, f2_style)
+
+    raw_diff = f1_factor - f2_factor
+    adjustment = max(-AGE_ADJUSTMENT_MAX,
+                     min(AGE_ADJUSTMENT_MAX, raw_diff * AGE_ADJUSTMENT_SCALE))
+
+    return {
+        "fighter1_age": f1_age,
+        "fighter2_age": f2_age,
+        "fighter1_factor": f1_factor,
+        "fighter2_factor": f2_factor,
+        "fighter1_style": f1_style,
+        "fighter2_style": f2_style,
+        "adjustment": round(adjustment, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6.4b Stance Matchup
+# ---------------------------------------------------------------------------
+
+def stance_matchup_adjustment(f1: dict, f2: dict,
+                              f1_style: str, f2_style: str) -> tuple[float, str]:
+    """Return a probability adjustment and description for stance matchup.
+
+    Southpaw vs Orthodox: favors southpaw (+0.020).
+    Switch vs Orthodox: favors switch (+0.015).
+    Switch vs Southpaw: favors switch (+0.010).
+    Same stance: 0.0.
+    Amplified by 1.5x when both fighters are strikers.
+    Positive value favors fighter 1.
+    """
+    s1 = (f1.get("stance") or "").strip()
+    s2 = (f2.get("stance") or "").strip()
+
+    if not s1 or not s2 or s1 == s2:
+        return 0.0, ""
+
+    striker_styles = ("Striker", "Counter Striker", "Pressure Fighter")
+    both_strikers = f1_style in striker_styles and f2_style in striker_styles
+
+    adjustment = 0.0
+    desc = ""
+
+    # Determine advantage based on stance pairing
+    if s1 == "Southpaw" and s2 == "Orthodox":
+        adjustment = STANCE_SOUTHPAW_VS_ORTHODOX
+        desc = f"Southpaw vs Orthodox — favors {f1['name']}"
+    elif s1 == "Orthodox" and s2 == "Southpaw":
+        adjustment = -STANCE_SOUTHPAW_VS_ORTHODOX
+        desc = f"Southpaw vs Orthodox — favors {f2['name']}"
+    elif s1 == "Switch" and s2 == "Orthodox":
+        adjustment = STANCE_SWITCH_VS_ORTHODOX
+        desc = f"Switch vs Orthodox — favors {f1['name']}"
+    elif s1 == "Orthodox" and s2 == "Switch":
+        adjustment = -STANCE_SWITCH_VS_ORTHODOX
+        desc = f"Switch vs Orthodox — favors {f2['name']}"
+    elif s1 == "Switch" and s2 == "Southpaw":
+        adjustment = STANCE_SWITCH_VS_SOUTHPAW
+        desc = f"Switch vs Southpaw — favors {f1['name']}"
+    elif s1 == "Southpaw" and s2 == "Switch":
+        adjustment = -STANCE_SWITCH_VS_SOUTHPAW
+        desc = f"Switch vs Southpaw — favors {f2['name']}"
+
+    if adjustment != 0.0 and both_strikers:
+        adjustment *= STANCE_STRIKER_AMPLIFIER
+        desc += " (amplified: both strikers)"
+
+    return round(adjustment, 4), desc
+
+
+# ---------------------------------------------------------------------------
 # 6.4 Physical Attribute Analysis
 # ---------------------------------------------------------------------------
 
@@ -228,10 +363,6 @@ def physical_analysis(f1: dict, f2: dict) -> dict:
     reach_diff = f1_reach - f2_reach
     height_diff = f1_height - f2_height
     physical_score = reach_diff * 0.5 + height_diff * 0.3
-    # Youth advantage (younger is slightly better, unless too young)
-    if f1_age and f2_age:
-        age_diff = f2_age - f1_age  # positive means f1 is younger
-        physical_score += age_diff * 0.2
 
     if physical_score > 0:
         edge = f1["name"]
@@ -249,8 +380,6 @@ def physical_analysis(f1: dict, f2: dict) -> dict:
         "fighter2_age": f2_age,
         "fighter1_stance": f1.get("stance"),
         "fighter2_stance": f2.get("stance"),
-        "fighter1_over_37": f1_age is not None and f1_age > 37,
-        "fighter2_over_37": f2_age is not None and f2_age > 37,
     }
 
 
@@ -642,6 +771,14 @@ def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
 
     style_adj, style_desc = style_matchup_modifier(f1, f2, f1_evolution, f2_evolution)
 
+    # Age matchup (uses effective styles from evolution data)
+    f1_eff_style = f1_evolution["effective_style"]
+    f2_eff_style = f2_evolution["effective_style"]
+    age = age_matchup_analysis(f1, f2, f1_eff_style, f2_eff_style)
+
+    # Stance matchup
+    stance_adj, stance_desc = stance_matchup_adjustment(f1, f2, f1_eff_style, f2_eff_style)
+
     # Weight class info
     f1_wc = database.get_fighter_primary_weight_class(f1_id)
     f2_wc = database.get_fighter_primary_weight_class(f2_id)
@@ -662,4 +799,7 @@ def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
         "fighter2_evolution": f2_evolution,
         "fighter1_weight_class": f1_wc,
         "fighter2_weight_class": f2_wc,
+        "age": age,
+        "stance_adjustment": stance_adj,
+        "stance_description": stance_desc,
     }

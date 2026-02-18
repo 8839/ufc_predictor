@@ -315,7 +315,11 @@ def calc_loss_quality(fighter_id: str, fqs_cache: dict | None = None) -> float:
             losses.append(fight)
 
     if not losses:
-        return 100.0
+        # Undefeated score scales with sample size — a 17-0 fighter is more
+        # proven than a 3-0 fighter, but neither should be a perfect 100
+        # to avoid a cliff between 0 and 1 losses.
+        # Asymptotes to 100 as fights increase.
+        return _clamp(90.0 + 10.0 * (1.0 - math.exp(-total_decided / 10.0)))
 
     # Calculate per-loss penalty multiplier (0 = no penalty, 1 = full penalty)
     penalties = []
@@ -367,9 +371,10 @@ def calc_loss_quality(fighter_id: str, fqs_cache: dict | None = None) -> float:
 
     # Scale by loss ratio — a 27-1 fighter (ratio ~0.04) should keep most of their score,
     # while a 5-5 fighter (ratio 0.5) feels the full weight.
-    # Use sqrt to soften the curve so a few losses still register.
+    # Use ratio^0.6 (gentler than sqrt) so a single loss in many fights
+    # doesn't create a large gap vs undefeated fighters.
     loss_ratio = len(losses) / total_decided if total_decided > 0 else 0
-    scaled_penalty = avg_penalty * math.sqrt(loss_ratio)
+    scaled_penalty = avg_penalty * (loss_ratio ** 0.6)
 
     # Convert: 0 penalty = 100 score, 1.0 penalty = 0 score
     return _clamp(100.0 - scaled_penalty * 100.0)
