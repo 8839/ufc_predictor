@@ -1,0 +1,17 @@
+{
+  "weights": {
+    "opponent_quality": 0.1553,
+    "win_method": 0.2789,
+    "loss_quality": 0.0388,
+    "recency": 0.0158,
+    "streak": 0.3833,
+    "championship": 0.0515,
+    "activity_rate": 0.0765
+  },
+  "train_accuracy": 55.08,
+  "test_accuracy_default": 62.46,
+  "test_accuracy_learned": 62.21,
+  "test_fights": 1569,
+  "train_samples": 1447,
+  "computed_date": "2026-02-20T06:09:34.620525"
+}

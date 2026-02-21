@@ -17,9 +17,10 @@ from scoring import calc_fqs
 # Fight-stats helpers (per-fight data from fight_stats table)
 # ---------------------------------------------------------------------------
 
-def _recent_fight_stats(fighter_id: str, n: int = 5) -> list[dict]:
+def _recent_fight_stats(fighter_id: str, n: int = 5,
+                        cutoff_date: str | None = None) -> list[dict]:
     """Get stats for a fighter's last N fights (most recent first)."""
-    fights = database.get_fighter_fights(fighter_id)
+    fights = database.get_fighter_fights(fighter_id, cutoff_date)
     recent = []
     for fight in fights[:n]:
         stats = database.get_fight_stats(fight["id"], fighter_id)
@@ -64,11 +65,12 @@ def _aggregate_fight_stats(stats_list: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def fqs_comparison(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
-                   wc_baselines: dict | None = None) -> dict:
+                   wc_baselines: dict | None = None,
+                   cutoff_date: str | None = None) -> dict:
     """Return FQS breakdown for both fighters."""
     return {
-        "fighter1": calc_fqs(f1_id, fqs_cache, wc_baselines),
-        "fighter2": calc_fqs(f2_id, fqs_cache, wc_baselines),
+        "fighter1": calc_fqs(f1_id, fqs_cache, wc_baselines, cutoff_date),
+        "fighter2": calc_fqs(f2_id, fqs_cache, wc_baselines, cutoff_date),
     }
 
 
@@ -76,7 +78,8 @@ def fqs_comparison(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
 # 6.2 Striking Analysis
 # ---------------------------------------------------------------------------
 
-def striking_analysis(f1: dict, f2: dict) -> dict:
+def striking_analysis(f1: dict, f2: dict,
+                      cutoff_date: str | None = None) -> dict:
     """Compare striking stats using career averages + recent fight stats."""
     # Career stats
     f1_slpm = f1.get("sig_strikes_landed_per_min") or 0.0
@@ -89,12 +92,12 @@ def striking_analysis(f1: dict, f2: dict) -> dict:
     f2_def = f2.get("sig_strike_defense") or 0.0
 
     # Recent form (last 5 fights) — blend with career stats for a more current picture
-    f1_recent = _aggregate_fight_stats(_recent_fight_stats(f1["id"], 5))
-    f2_recent = _aggregate_fight_stats(_recent_fight_stats(f2["id"], 5))
+    f1_recent = _aggregate_fight_stats(_recent_fight_stats(f1["id"], 5, cutoff_date))
+    f2_recent = _aggregate_fight_stats(_recent_fight_stats(f2["id"], 5, cutoff_date))
 
     # Knockdown rate from fight stats (career + recent)
-    f1_kd_rate = _knockdown_rate(f1["id"])
-    f2_kd_rate = _knockdown_rate(f2["id"])
+    f1_kd_rate = _knockdown_rate(f1["id"], cutoff_date)
+    f2_kd_rate = _knockdown_rate(f2["id"], cutoff_date)
     f1_recent_kd = f1_recent["avg_kd"]
     f2_recent_kd = f2_recent["avg_kd"]
 
@@ -147,9 +150,9 @@ def striking_analysis(f1: dict, f2: dict) -> dict:
     }
 
 
-def _knockdown_rate(fighter_id: str) -> float:
+def _knockdown_rate(fighter_id: str, cutoff_date: str | None = None) -> float:
     """Knockdowns per fight for a fighter."""
-    stats = database.get_fighter_all_stats(fighter_id)
+    stats = database.get_fighter_all_stats(fighter_id, cutoff_date)
     if not stats:
         return 0.0
     total_kd = sum(s.get("knockdowns", 0) for s in stats)
@@ -160,7 +163,8 @@ def _knockdown_rate(fighter_id: str) -> float:
 # 6.3 Grappling Analysis
 # ---------------------------------------------------------------------------
 
-def grappling_analysis(f1: dict, f2: dict) -> dict:
+def grappling_analysis(f1: dict, f2: dict,
+                       cutoff_date: str | None = None) -> dict:
     """Compare grappling stats using career averages + recent fight stats."""
     f1_td = f1.get("takedown_avg_per_15min") or 0.0
     f2_td = f2.get("takedown_avg_per_15min") or 0.0
@@ -172,12 +176,12 @@ def grappling_analysis(f1: dict, f2: dict) -> dict:
     f2_sub = f2.get("submission_avg_per_15min") or 0.0
 
     # Recent form for control time and TD accuracy (more current than career avg)
-    f1_recent = _aggregate_fight_stats(_recent_fight_stats(f1["id"], 5))
-    f2_recent = _aggregate_fight_stats(_recent_fight_stats(f2["id"], 5))
+    f1_recent = _aggregate_fight_stats(_recent_fight_stats(f1["id"], 5, cutoff_date))
+    f2_recent = _aggregate_fight_stats(_recent_fight_stats(f2["id"], 5, cutoff_date))
 
     # Use recent control time if available, otherwise career
-    f1_ctrl = f1_recent["avg_ctrl"] if f1_recent["count"] >= 3 else _avg_control_time(f1["id"])
-    f2_ctrl = f2_recent["avg_ctrl"] if f2_recent["count"] >= 3 else _avg_control_time(f2["id"])
+    f1_ctrl = f1_recent["avg_ctrl"] if f1_recent["count"] >= 3 else _avg_control_time(f1["id"], cutoff_date)
+    f2_ctrl = f2_recent["avg_ctrl"] if f2_recent["count"] >= 3 else _avg_control_time(f2["id"], cutoff_date)
 
     # Weight TD volume and control time heavily — these indicate actual grappling activity.
     # TD accuracy is only meaningful with volume, so scale it by TD avg.
@@ -217,9 +221,9 @@ def grappling_analysis(f1: dict, f2: dict) -> dict:
     }
 
 
-def _avg_control_time(fighter_id: str) -> float:
+def _avg_control_time(fighter_id: str, cutoff_date: str | None = None) -> float:
     """Average control time in seconds per fight."""
-    stats = database.get_fighter_all_stats(fighter_id)
+    stats = database.get_fighter_all_stats(fighter_id, cutoff_date)
     if not stats:
         return 0.0
     total = sum(s.get("control_time_seconds", 0) for s in stats)
@@ -387,10 +391,11 @@ def physical_analysis(f1: dict, f2: dict) -> dict:
 # 6.5 Common Opponent Analysis
 # ---------------------------------------------------------------------------
 
-def common_opponent_analysis(f1_id: str, f2_id: str) -> dict:
+def common_opponent_analysis(f1_id: str, f2_id: str,
+                             cutoff_date: str | None = None) -> dict:
     """Find common opponents and compare results."""
-    f1_fights = database.get_fighter_fights(f1_id)
-    f2_fights = database.get_fighter_fights(f2_id)
+    f1_fights = database.get_fighter_fights(f1_id, cutoff_date)
+    f2_fights = database.get_fighter_fights(f2_id, cutoff_date)
 
     def _opponents(fights, fighter_id):
         opps = {}
@@ -626,7 +631,8 @@ def _infer_recent_style(fighter: dict, recent_profile: dict,
     return classify_style(adjusted)
 
 
-def detect_style_evolution(fighter: dict) -> dict:
+def detect_style_evolution(fighter: dict,
+                           cutoff_date: str | None = None) -> dict:
     """Detect whether a fighter's style has evolved recently.
 
     Uses proportion-based comparison: compares the balance of striking vs
@@ -645,7 +651,7 @@ def detect_style_evolution(fighter: dict) -> dict:
         "evolution_note": None,
     }
 
-    fights = database.get_fighter_fights(fighter["id"])
+    fights = database.get_fighter_fights(fighter["id"], cutoff_date)
     recent_fights = fights[:STYLE_RECENT_FIGHT_COUNT]
 
     if len(recent_fights) < 3:
@@ -691,7 +697,8 @@ def detect_style_evolution(fighter: dict) -> dict:
 
 def style_matchup_modifier(f1: dict, f2: dict,
                            f1_evolution: dict | None = None,
-                           f2_evolution: dict | None = None) -> tuple[float, str]:
+                           f2_evolution: dict | None = None,
+                           cutoff_date: str | None = None) -> tuple[float, str]:
     """Return a probability adjustment and description for the style matchup.
 
     Positive value favors fighter 1, negative favors fighter 2.
@@ -735,8 +742,8 @@ def style_matchup_modifier(f1: dict, f2: dict,
     elif s1 in striker_styles and s2 in striker_styles:
         f1_acc = f1.get("sig_strike_accuracy") or 0.0
         f2_acc = f2.get("sig_strike_accuracy") or 0.0
-        kd1 = _knockdown_rate(f1["id"])
-        kd2 = _knockdown_rate(f2["id"])
+        kd1 = _knockdown_rate(f1["id"], cutoff_date)
+        kd2 = _knockdown_rate(f2["id"], cutoff_date)
         if f1_acc > f2_acc and kd1 >= kd2:
             adjustment = 0.03
             description += f" \u2014 {f1['name']} more accurate/powerful"
@@ -754,22 +761,23 @@ def style_matchup_modifier(f1: dict, f2: dict,
 
 
 def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
-                 wc_baselines: dict | None = None) -> dict:
+                 wc_baselines: dict | None = None,
+                 cutoff_date: str | None = None) -> dict:
     """Run all matchup analyses and return combined results."""
     f1 = database.get_fighter(f1_id)
     f2 = database.get_fighter(f2_id)
 
-    fqs = fqs_comparison(f1_id, f2_id, fqs_cache, wc_baselines)
-    striking = striking_analysis(f1, f2)
-    grappling = grappling_analysis(f1, f2)
+    fqs = fqs_comparison(f1_id, f2_id, fqs_cache, wc_baselines, cutoff_date)
+    striking = striking_analysis(f1, f2, cutoff_date)
+    grappling = grappling_analysis(f1, f2, cutoff_date)
     physical = physical_analysis(f1, f2)
-    common = common_opponent_analysis(f1_id, f2_id)
+    common = common_opponent_analysis(f1_id, f2_id, cutoff_date)
 
     # Style evolution detection
-    f1_evolution = detect_style_evolution(f1)
-    f2_evolution = detect_style_evolution(f2)
+    f1_evolution = detect_style_evolution(f1, cutoff_date)
+    f2_evolution = detect_style_evolution(f2, cutoff_date)
 
-    style_adj, style_desc = style_matchup_modifier(f1, f2, f1_evolution, f2_evolution)
+    style_adj, style_desc = style_matchup_modifier(f1, f2, f1_evolution, f2_evolution, cutoff_date)
 
     # Age matchup (uses effective styles from evolution data)
     f1_eff_style = f1_evolution["effective_style"]
@@ -780,8 +788,8 @@ def full_matchup(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
     stance_adj, stance_desc = stance_matchup_adjustment(f1, f2, f1_eff_style, f2_eff_style)
 
     # Weight class info
-    f1_wc = database.get_fighter_primary_weight_class(f1_id)
-    f2_wc = database.get_fighter_primary_weight_class(f2_id)
+    f1_wc = database.get_fighter_primary_weight_class(f1_id, cutoff_date)
+    f2_wc = database.get_fighter_primary_weight_class(f2_id, cutoff_date)
 
     return {
         "fighter1": f1,
