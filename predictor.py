@@ -13,12 +13,14 @@ from matchup import full_matchup
 
 
 def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
-                  wc_baselines: dict | None = None) -> dict:
+                  wc_baselines: dict | None = None,
+                  cutoff_date: str | None = None) -> dict:
     """Generate a full fight prediction.
 
     Returns a dict with all matchup data plus prediction details.
+    If cutoff_date is provided, only uses fight data before that date.
     """
-    analysis = full_matchup(f1_id, f2_id, fqs_cache, wc_baselines)
+    analysis = full_matchup(f1_id, f2_id, fqs_cache, wc_baselines, cutoff_date)
     f1 = analysis["fighter1"]
     f2 = analysis["fighter2"]
     fqs = analysis["fqs"]
@@ -124,14 +126,14 @@ def predict_fight(f1_id: str, f2_id: str, fqs_cache: dict | None = None,
 
     # 7.2 Predicted method of victory
     weight_class = analysis.get("fighter1_weight_class") or analysis.get("fighter2_weight_class")
-    method, round_range = _predict_method(winner_id, loser["id"], weight_class, wc_baselines)
+    method, round_range = _predict_method(winner_id, loser["id"], weight_class, wc_baselines, cutoff_date)
 
     # 7.3 Confidence label
     label = utils.confidence_label(win_prob)
 
     # Limited data warning
-    f1_fights = database.get_fighter_fights(f1_id)
-    f2_fights = database.get_fighter_fights(f2_id)
+    f1_fights = database.get_fighter_fights(f1_id, cutoff_date)
+    f2_fights = database.get_fighter_fights(f2_id, cutoff_date)
     limited_data = len(f1_fights) < 3 or len(f2_fights) < 3
 
     prediction = {
@@ -164,12 +166,13 @@ def _is_decision(method: str) -> bool:
 
 def _predict_method(winner_id: str, loser_id: str,
                     weight_class: str | None = None,
-                    wc_baselines: dict | None = None) -> tuple[str, str]:
+                    wc_baselines: dict | None = None,
+                    cutoff_date: str | None = None) -> tuple[str, str]:
     """Predict method of victory and approximate round range.
 
     Blends fighter rates with weight-class tendencies (80/20) when available.
     """
-    fights = database.get_fighter_fights(winner_id)
+    fights = database.get_fighter_fights(winner_id, cutoff_date)
 
     ko_count = 0
     sub_count = 0
@@ -202,7 +205,7 @@ def _predict_method(winner_id: str, loser_id: str,
     finish_rate = (ko_count + sub_count) / total_wins
 
     # Check loser's vulnerability
-    loser_fights = database.get_fighter_fights(loser_id)
+    loser_fights = database.get_fighter_fights(loser_id, cutoff_date)
     loser_ko_losses = 0
     loser_sub_losses = 0
     loser_total_losses = 0

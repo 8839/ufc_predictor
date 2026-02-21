@@ -9,17 +9,18 @@ build/
 .venv/
 venv/
 env/
-data/ufc.db
 .env
 *.log
-# Databases
+
+# Database files
 *.db
 *.sqlite
 *.sqlite3
 *.duckdb
 
-# If your DB is in a specific folder, ignore that too:
-data/
-db/
-database/
-data/ufc.db
+# Data directory — keep JSON outputs, ignore DB
+data/*.db
+
+# OS files
+.DS_Store
+Thumbs.db

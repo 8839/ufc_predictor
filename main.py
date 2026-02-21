@@ -14,6 +14,7 @@ from predictor import (
     save_prediction,
 )
 from scoring import compute_weight_class_baselines
+from backtest import run_backtest
 
 
 def cmd_scrape(args):
@@ -98,6 +99,12 @@ def cmd_update_result(args):
         print(f"Prediction #{args.prediction_id} marked as WRONG.")
 
 
+def cmd_backtest(args):
+    """Handle backtest command."""
+    database.init_db()
+    run_backtest(use_learned_weights=not args.no_learn)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="UFC Fight Predictor — predict fight outcomes using data analysis"
@@ -150,6 +157,17 @@ def main():
         "--method", required=True, help="Actual method of victory"
     )
     update_parser.set_defaults(func=cmd_update_result)
+
+    # backtest
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Backtest predictions on 2023+ fights and learn optimal FQS weights"
+    )
+    backtest_parser.add_argument(
+        "--no-learn", action="store_true",
+        help="Skip weight learning, only test with default weights"
+    )
+    backtest_parser.set_defaults(func=cmd_backtest)
 
     args = parser.parse_args()
     if not args.command:

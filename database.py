@@ -215,14 +215,24 @@ def upsert_fight(fight: dict):
     conn.close()
 
 
-def get_fighter_fights(fighter_id: str) -> list[dict]:
-    """Get all fights for a given fighter, ordered by date descending."""
+def get_fighter_fights(fighter_id: str, cutoff_date: str | None = None) -> list[dict]:
+    """Get all fights for a given fighter, ordered by date descending.
+
+    If cutoff_date is provided (YYYY-MM-DD), only returns fights before that date.
+    """
     conn = get_connection()
-    rows = conn.execute("""
-        SELECT * FROM fights
-        WHERE fighter1_id = ? OR fighter2_id = ?
-        ORDER BY event_date DESC
-    """, (fighter_id, fighter_id)).fetchall()
+    if cutoff_date:
+        rows = conn.execute("""
+            SELECT * FROM fights
+            WHERE (fighter1_id = ? OR fighter2_id = ?) AND event_date < ?
+            ORDER BY event_date DESC
+        """, (fighter_id, fighter_id, cutoff_date)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM fights
+            WHERE fighter1_id = ? OR fighter2_id = ?
+            ORDER BY event_date DESC
+        """, (fighter_id, fighter_id)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -283,12 +293,22 @@ def get_fight_stats(fight_id: str, fighter_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def get_fighter_all_stats(fighter_id: str) -> list[dict]:
-    """Get all fight stats for a fighter across all their fights."""
+def get_fighter_all_stats(fighter_id: str, cutoff_date: str | None = None) -> list[dict]:
+    """Get all fight stats for a fighter across all their fights.
+
+    If cutoff_date is provided (YYYY-MM-DD), only returns stats from fights before that date.
+    """
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM fight_stats WHERE fighter_id = ?", (fighter_id,)
-    ).fetchall()
+    if cutoff_date:
+        rows = conn.execute("""
+            SELECT fs.* FROM fight_stats fs
+            JOIN fights f ON fs.fight_id = f.id
+            WHERE fs.fighter_id = ? AND f.event_date < ?
+        """, (fighter_id, cutoff_date)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM fight_stats WHERE fighter_id = ?", (fighter_id,)
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -375,29 +395,48 @@ def get_prediction(prediction_id: int) -> dict | None:
 # Weight Class Baselines
 # ---------------------------------------------------------------------------
 
-def get_fighter_primary_weight_class(fighter_id: str) -> str | None:
+def get_fighter_primary_weight_class(fighter_id: str, cutoff_date: str | None = None) -> str | None:
     """Return the most frequent weight class for a fighter."""
     conn = get_connection()
-    row = conn.execute("""
-        SELECT weight_class, COUNT(*) as cnt
-        FROM fights
-        WHERE (fighter1_id = ? OR fighter2_id = ?) AND weight_class IS NOT NULL
-        GROUP BY weight_class
-        ORDER BY cnt DESC
-        LIMIT 1
-    """, (fighter_id, fighter_id)).fetchone()
+    if cutoff_date:
+        row = conn.execute("""
+            SELECT weight_class, COUNT(*) as cnt
+            FROM fights
+            WHERE (fighter1_id = ? OR fighter2_id = ?) AND weight_class IS NOT NULL
+                  AND event_date < ?
+            GROUP BY weight_class
+            ORDER BY cnt DESC
+            LIMIT 1
+        """, (fighter_id, fighter_id, cutoff_date)).fetchone()
+    else:
+        row = conn.execute("""
+            SELECT weight_class, COUNT(*) as cnt
+            FROM fights
+            WHERE (fighter1_id = ? OR fighter2_id = ?) AND weight_class IS NOT NULL
+            GROUP BY weight_class
+            ORDER BY cnt DESC
+            LIMIT 1
+        """, (fighter_id, fighter_id)).fetchone()
     conn.close()
     return row["weight_class"] if row else None
 
 
-def get_fighter_fight_dates(fighter_id: str) -> list[str]:
+def get_fighter_fight_dates(fighter_id: str, cutoff_date: str | None = None) -> list[str]:
     """Return event dates for a fighter's fights, most recent first."""
     conn = get_connection()
-    rows = conn.execute("""
-        SELECT event_date FROM fights
-        WHERE (fighter1_id = ? OR fighter2_id = ?) AND event_date IS NOT NULL
-        ORDER BY event_date DESC
-    """, (fighter_id, fighter_id)).fetchall()
+    if cutoff_date:
+        rows = conn.execute("""
+            SELECT event_date FROM fights
+            WHERE (fighter1_id = ? OR fighter2_id = ?) AND event_date IS NOT NULL
+                  AND event_date < ?
+            ORDER BY event_date DESC
+        """, (fighter_id, fighter_id, cutoff_date)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT event_date FROM fights
+            WHERE (fighter1_id = ? OR fighter2_id = ?) AND event_date IS NOT NULL
+            ORDER BY event_date DESC
+        """, (fighter_id, fighter_id)).fetchall()
     conn.close()
     return [r["event_date"] for r in rows]
 
@@ -421,6 +460,28 @@ def upsert_weight_class_baseline(baseline: dict):
     """, baseline)
     conn.commit()
     conn.close()
+
+
+def get_fights_in_range(start_date: str | None = None, end_date: str | None = None,
+                        require_winner: bool = True) -> list[dict]:
+    """Get fights within a date range. Both bounds are optional."""
+    conn = get_connection()
+    conditions = []
+    params = []
+    if require_winner:
+        conditions.append("winner_id IS NOT NULL")
+    if start_date:
+        conditions.append("event_date >= ?")
+        params.append(start_date)
+    if end_date:
+        conditions.append("event_date < ?")
+        params.append(end_date)
+    where = " AND ".join(conditions) if conditions else "1=1"
+    rows = conn.execute(
+        f"SELECT * FROM fights WHERE {where} ORDER BY event_date", params
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def get_all_weight_class_baselines() -> dict[str, dict]:
